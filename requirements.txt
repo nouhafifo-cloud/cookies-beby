@@ -1,1 +1,4 @@
-
+pyTelegramBotAPI
+pyzipper
+requests
+urllib3
