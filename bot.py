@@ -101,17 +101,15 @@ def check_netflix_cookie_detailed(netflix_id):
                 membership_status = value_data.get("membershipStatus", "UNKNOWN")
                 is_on_hold = value_data.get("accountHold", False) or value_data.get("isInHoldStatus", False)
                 geoblock_status = value_data.get("geoBlockStatus", {})
-                if membership_status != "FORMER_MEMBER" and not is_on_hold and not geoblock_status.get("isBlocked", False):
+                
+                # التحقق الصارم من أن الحساب نشط وليس منتهي أو مجمد
+                if membership_status in ["ACTIVE", "CURRENT_MEMBER"] and not is_on_hold and not geoblock_status.get("isBlocked", False):
                     return {"token": token, "expires": expires, "bypass": False}
         
-        fallback_url = "https://www.netflix.com/YourAccount"
-        res_fallback = requests.get(fallback_url, headers={"User-Agent": "Mozilla/5.0", "Cookie": f"NetflixId={netflix_id}"}, timeout=8, allow_redirects=False)
-        if res_fallback.status_code in [200, 302] and "login" not in res_fallback.headers.get("Location", "").lower():
-            return {"token": "BYPASS_VALID_OK", "expires": int(time.time()) + 2592000, "bypass": True}
+        # إلغاء الاعتماد على الـ Fallback الضعيف الذي يقبل الحسابات المنتهية
         return None
     except Exception:
         return None
-
 def auto_clean_pool_job():
     global VALID_COOKIES_POOL
     while True:
